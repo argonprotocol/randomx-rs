@@ -41,33 +41,17 @@ pub mod test_utils;
 use std::{convert::TryFrom, num::TryFromIntError, ptr, sync::Arc};
 
 use bindings::{
-    randomx_alloc_cache,
-    randomx_alloc_dataset,
-    randomx_cache,
-    randomx_calculate_hash,
-    randomx_create_vm,
-    randomx_dataset,
-    randomx_dataset_item_count,
-    randomx_destroy_vm,
-    randomx_get_dataset_memory,
-    randomx_init_cache,
-    randomx_init_dataset,
-    randomx_release_cache,
-    randomx_release_dataset,
-    randomx_vm,
-    randomx_vm_set_cache,
-    randomx_vm_set_dataset,
-    RANDOMX_HASH_SIZE,
+    randomx_alloc_cache, randomx_alloc_dataset, randomx_cache, randomx_calculate_hash, randomx_create_vm,
+    randomx_dataset, randomx_dataset_item_count, randomx_destroy_vm, randomx_get_dataset_memory, randomx_init_cache,
+    randomx_init_dataset, randomx_release_cache, randomx_release_dataset, randomx_vm, randomx_vm_set_cache,
+    randomx_vm_set_dataset, RANDOMX_HASH_SIZE,
 };
 use bitflags::bitflags;
 use libc::{c_ulong, c_void};
 use thiserror::Error;
 
 use crate::bindings::{
-    randomx_calculate_hash_first,
-    randomx_calculate_hash_last,
-    randomx_calculate_hash_next,
-    randomx_get_flags,
+    randomx_calculate_hash_first, randomx_calculate_hash_last, randomx_calculate_hash_next, randomx_get_flags,
 };
 
 bitflags! {
@@ -176,13 +160,23 @@ impl RandomXCache {
             } else {
                 let inner = RandomXCacheInner { cache_ptr };
                 let result = RandomXCache { inner: Arc::new(inner) };
-                let key_ptr = key.as_ptr() as *mut c_void;
-                let key_size = key.len();
-                unsafe {
-                    randomx_init_cache(result.inner.cache_ptr, key_ptr, key_size);
-                }
+                result.init(key)?;
                 Ok(result)
             }
+        }
+    }
+
+    /// Initializes (or re-initializes) the cache object with the given key.
+    pub fn init(&self, key: &[u8]) -> Result<(), RandomXError> {
+        if key.is_empty() {
+            Err(RandomXError::ParameterError("key is empty".to_string()))
+        } else {
+            let key_ptr = key.as_ptr() as *mut c_void;
+            let key_size = key.len();
+            unsafe {
+                randomx_init_cache(self.inner.cache_ptr, key_ptr, key_size);
+            }
+            Ok(())
         }
     }
 }
@@ -223,6 +217,12 @@ impl RandomXDataset {
     // Conversions may be lossy on Windows or Linux
     #[allow(clippy::useless_conversion)]
     pub fn new(flags: RandomXFlag, cache: RandomXCache, start: u32) -> Result<RandomXDataset, RandomXError> {
+        let result = Self::alloc(flags, cache.clone())?;
+        result.init(start, result.inner.dataset_count)?;
+        Ok(result)
+    }
+    /// Allocate but don't initialize the dataset object.
+    pub fn alloc(flags: RandomXFlag, cache: RandomXCache) -> Result<RandomXDataset, RandomXError> {
         let item_count = RandomXDataset::count()
             .map_err(|e| RandomXError::CreationError(format!("Could not get dataset count: {e:?}")))?;
 
@@ -236,22 +236,25 @@ impl RandomXDataset {
                 cache,
             };
             let result = RandomXDataset { inner: Arc::new(inner) };
-
-            if start < item_count {
-                unsafe {
-                    randomx_init_dataset(
-                        result.inner.dataset_ptr,
-                        result.inner.cache.inner.cache_ptr,
-                        c_ulong::from(start),
-                        c_ulong::from(item_count),
-                    );
-                }
-                Ok(result)
-            } else {
-                Err(RandomXError::CreationError(format!(
-                    "start must be less than item_count: start: {start}, item_count: {item_count}",
-                )))
+            Ok(result)
+        }
+    }
+    /// Initializes the `dataset` object with the given start and item_count.
+    pub fn init(&self, start: u32, item_count: u32) -> Result<(), RandomXError> {
+        if start < item_count {
+            unsafe {
+                randomx_init_dataset(
+                    self.inner.dataset_ptr,
+                    self.inner.cache.inner.cache_ptr,
+                    c_ulong::from(start),
+                    c_ulong::from(item_count),
+                );
             }
+            Ok(())
+        } else {
+            Err(RandomXError::CreationError(format!(
+                "start must be less than item_count: start: {start}, item_count: {item_count}",
+            )))
         }
     }
 
@@ -635,10 +638,13 @@ mod tests {
         let dataset = RandomXDataset::new(flags, cache.clone(), 0).unwrap();
         let vm = RandomXVM::new(flags, Some(cache.clone()), Some(dataset.clone())).unwrap();
         let hash = vm.calculate_hash(input.as_bytes()).expect("no data");
-        assert_eq!(hash, [
-            114, 81, 192, 5, 165, 242, 107, 100, 184, 77, 37, 129, 52, 203, 217, 227, 65, 83, 215, 213, 59, 71, 32,
-            172, 253, 155, 204, 111, 183, 213, 157, 155
-        ]);
+        assert_eq!(
+            hash,
+            [
+                114, 81, 192, 5, 165, 242, 107, 100, 184, 77, 37, 129, 52, 203, 217, 227, 65, 83, 215, 213, 59, 71, 32,
+                172, 253, 155, 204, 111, 183, 213, 157, 155
+            ]
+        );
         drop(vm);
         drop(dataset);
         drop(cache);
@@ -647,10 +653,13 @@ mod tests {
         let dataset1 = RandomXDataset::new(flags, cache1.clone(), 0).unwrap();
         let vm1 = RandomXVM::new(flags, Some(cache1.clone()), Some(dataset1.clone())).unwrap();
         let hash1 = vm1.calculate_hash(input.as_bytes()).expect("no data");
-        assert_eq!(hash1, [
-            114, 81, 192, 5, 165, 242, 107, 100, 184, 77, 37, 129, 52, 203, 217, 227, 65, 83, 215, 213, 59, 71, 32,
-            172, 253, 155, 204, 111, 183, 213, 157, 155
-        ]);
+        assert_eq!(
+            hash1,
+            [
+                114, 81, 192, 5, 165, 242, 107, 100, 184, 77, 37, 129, 52, 203, 217, 227, 65, 83, 215, 213, 59, 71, 32,
+                172, 253, 155, 204, 111, 183, 213, 157, 155
+            ]
+        );
         drop(vm1);
         drop(dataset1);
         drop(cache1);
@@ -667,10 +676,13 @@ mod tests {
         drop(dataset);
         drop(cache);
         let hash = vm.calculate_hash(input.as_bytes()).expect("no data");
-        assert_eq!(hash, [
-            114, 81, 192, 5, 165, 242, 107, 100, 184, 77, 37, 129, 52, 203, 217, 227, 65, 83, 215, 213, 59, 71, 32,
-            172, 253, 155, 204, 111, 183, 213, 157, 155
-        ]);
+        assert_eq!(
+            hash,
+            [
+                114, 81, 192, 5, 165, 242, 107, 100, 184, 77, 37, 129, 52, 203, 217, 227, 65, 83, 215, 213, 59, 71, 32,
+                172, 253, 155, 204, 111, 183, 213, 157, 155
+            ]
+        );
         drop(vm);
 
         let cache1 = RandomXCache::new(flags, key.as_bytes()).unwrap();
@@ -679,10 +691,13 @@ mod tests {
         drop(dataset1);
         drop(cache1);
         let hash1 = vm1.calculate_hash(input.as_bytes()).expect("no data");
-        assert_eq!(hash1, [
-            114, 81, 192, 5, 165, 242, 107, 100, 184, 77, 37, 129, 52, 203, 217, 227, 65, 83, 215, 213, 59, 71, 32,
-            172, 253, 155, 204, 111, 183, 213, 157, 155
-        ]);
+        assert_eq!(
+            hash1,
+            [
+                114, 81, 192, 5, 165, 242, 107, 100, 184, 77, 37, 129, 52, 203, 217, 227, 65, 83, 215, 213, 59, 71, 32,
+                172, 253, 155, 204, 111, 183, 213, 157, 155
+            ]
+        );
         drop(vm1);
     }
 
