@@ -137,6 +137,9 @@ pub struct RandomXCache {
     inner: Arc<RandomXCacheInner>,
 }
 
+unsafe impl Send for RandomXCache {}
+unsafe impl Sync for RandomXCache {}
+
 impl RandomXCache {
     /// Creates and alllcates memory for a new cache object, and initializes it with
     /// the key value.
@@ -204,6 +207,9 @@ pub struct RandomXDataset {
     inner: Arc<RandomXDatasetInner>,
 }
 
+unsafe impl Send for RandomXDataset {}
+unsafe impl Sync for RandomXDataset {}
+
 impl RandomXDataset {
     /// Creates a new dataset object, allocates memory to the `dataset` object and initializes it.
     ///
@@ -241,7 +247,7 @@ impl RandomXDataset {
     }
     /// Initializes the `dataset` object with the given start and item_count.
     pub fn init(&self, start: u32, item_count: u32) -> Result<(), RandomXError> {
-        if start < item_count {
+        if start + item_count <= self.inner.dataset_count {
             unsafe {
                 randomx_init_dataset(
                     self.inner.dataset_ptr,
@@ -253,7 +259,7 @@ impl RandomXDataset {
             Ok(())
         } else {
             Err(RandomXError::CreationError(format!(
-                "start must be less than item_count: start: {start}, item_count: {item_count}",
+                "start plus item_count must be less than dataset count: start: {start}, item_count: {item_count}, dataset_count: {}", self.inner.dataset_count
             )))
         }
     }
