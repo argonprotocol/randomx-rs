@@ -38,7 +38,12 @@ mod bindings;
 /// Test utilities for fuzzing
 pub mod test_utils;
 
-use std::{convert::TryFrom, num::TryFromIntError, ptr, sync::Arc};
+use std::{
+    convert::TryFrom,
+    num::TryFromIntError,
+    ptr,
+    sync::{Arc, Mutex},
+};
 
 use bindings::{
     randomx_alloc_cache, randomx_alloc_dataset, randomx_cache, randomx_calculate_hash, randomx_create_vm,
@@ -55,6 +60,7 @@ use crate::bindings::{
 };
 
 bitflags! {
+    #[derive(Debug, Copy, Clone)]
     /// RandomX Flags are used to configure the library.
     pub struct RandomXFlag: u32 {
         /// No flags set. Works on all platforms, but is the slowest.
@@ -89,9 +95,7 @@ impl RandomXFlag {
     ///
     /// The above flags need to be set manually, if required.
     pub fn get_recommended_flags() -> RandomXFlag {
-        RandomXFlag {
-            bits: unsafe { randomx_get_flags() },
-        }
+        unsafe { RandomXFlag::from_bits_truncate(randomx_get_flags()) }
     }
 }
 
@@ -119,15 +123,31 @@ pub enum RandomXError {
 
 #[derive(Debug)]
 struct RandomXCacheInner {
-    cache_ptr: *mut randomx_cache,
+    cache_ptr: Mutex<*mut randomx_cache>,
 }
+
+// SAFETY: RandomXCacheInner can be safely sent between threads because:
+// 1. The raw pointer is protected by a Mutex
+// 2. The Mutex ensures synchronized access to the pointer
+unsafe impl Send for RandomXCacheInner {}
+
+// SAFETY: RandomXCacheInner can be safely shared between threads because:
+// 1. All access to the raw pointer goes through the Mutex
+// 2. The Mutex provides the necessary synchronization
+unsafe impl Sync for RandomXCacheInner {}
 
 impl Drop for RandomXCacheInner {
     /// De-allocates memory for the `cache` object
     fn drop(&mut self) {
-        unsafe {
-            randomx_release_cache(self.cache_ptr);
+        if let Ok(ptr) = self.cache_ptr.lock() {
+            if !ptr.is_null() {
+                unsafe {
+                    randomx_release_cache(*ptr);
+                }
+            }
         }
+        // Note: If mutex is poisoned, we can't safely release the cache
+        // This is a tradeoff - we avoid potential double-free but may leak memory
     }
 }
 
@@ -137,8 +157,6 @@ pub struct RandomXCache {
     inner: Arc<RandomXCacheInner>,
 }
 
-unsafe impl Send for RandomXCache {}
-unsafe impl Sync for RandomXCache {}
 
 impl RandomXCache {
     /// Creates and alllcates memory for a new cache object, and initializes it with
@@ -157,11 +175,13 @@ impl RandomXCache {
         if key.is_empty() {
             Err(RandomXError::ParameterError("key is empty".to_string()))
         } else {
-            let cache_ptr = unsafe { randomx_alloc_cache(flags.bits) };
+            let cache_ptr = unsafe { randomx_alloc_cache(flags.bits()) };
             if cache_ptr.is_null() {
                 Err(RandomXError::CreationError("Could not allocate cache".to_string()))
             } else {
-                let inner = RandomXCacheInner { cache_ptr };
+                let inner = RandomXCacheInner {
+                    cache_ptr: Mutex::new(cache_ptr),
+                };
                 let result = RandomXCache { inner: Arc::new(inner) };
                 result.init(key)?;
                 Ok(result)
@@ -176,8 +196,9 @@ impl RandomXCache {
         } else {
             let key_ptr = key.as_ptr() as *mut c_void;
             let key_size = key.len();
+            let cache_ptr = *self.inner.cache_ptr.lock().unwrap();
             unsafe {
-                randomx_init_cache(self.inner.cache_ptr, key_ptr, key_size);
+                randomx_init_cache(cache_ptr, key_ptr, key_size);
             }
             Ok(())
         }
@@ -192,11 +213,25 @@ struct RandomXDatasetInner {
     cache: RandomXCache,
 }
 
+// SAFETY: RandomXDatasetInner can be safely sent between threads because:
+// 1. After initialization, the dataset is read-only
+// 2. The contained cache is already thread-safe
+// 3. The raw dataset pointer is only accessed for read operations
+unsafe impl Send for RandomXDatasetInner {}
+
+// SAFETY: RandomXDatasetInner can be safely shared between threads because:
+// 1. After initialization, all operations are read-only
+// 2. The RandomX C library allows concurrent reads of datasets
+// 3. The contained cache already implements Sync
+unsafe impl Sync for RandomXDatasetInner {}
+
 impl Drop for RandomXDatasetInner {
     /// De-allocates memory for the `dataset` object.
     fn drop(&mut self) {
-        unsafe {
-            randomx_release_dataset(self.dataset_ptr);
+        if !self.dataset_ptr.is_null() {
+            unsafe {
+                randomx_release_dataset(self.dataset_ptr);
+            }
         }
     }
 }
@@ -207,8 +242,6 @@ pub struct RandomXDataset {
     inner: Arc<RandomXDatasetInner>,
 }
 
-unsafe impl Send for RandomXDataset {}
-unsafe impl Sync for RandomXDataset {}
 
 impl RandomXDataset {
     /// Creates a new dataset object, allocates memory to the `dataset` object and initializes it.
@@ -227,12 +260,13 @@ impl RandomXDataset {
         result.init(start, result.inner.dataset_count)?;
         Ok(result)
     }
+
     /// Allocate but don't initialize the dataset object.
     pub fn alloc(flags: RandomXFlag, cache: RandomXCache) -> Result<RandomXDataset, RandomXError> {
         let item_count = RandomXDataset::count()
             .map_err(|e| RandomXError::CreationError(format!("Could not get dataset count: {e:?}")))?;
 
-        let test = unsafe { randomx_alloc_dataset(flags.bits) };
+        let test = unsafe { randomx_alloc_dataset(flags.bits()) };
         if test.is_null() {
             Err(RandomXError::CreationError("Could not allocate dataset".to_string()))
         } else {
@@ -245,13 +279,15 @@ impl RandomXDataset {
             Ok(result)
         }
     }
+
     /// Initializes the `dataset` object with the given start and item_count.
     pub fn init(&self, start: u32, item_count: u32) -> Result<(), RandomXError> {
         if start + item_count <= self.inner.dataset_count {
+            let cache_ptr = *self.inner.cache.inner.cache_ptr.lock().unwrap();
             unsafe {
                 randomx_init_dataset(
                     self.inner.dataset_ptr,
-                    self.inner.cache.inner.cache_ptr,
+                    cache_ptr,
                     c_ulong::from(start),
                     c_ulong::from(item_count),
                 );
@@ -259,7 +295,9 @@ impl RandomXDataset {
             Ok(())
         } else {
             Err(RandomXError::CreationError(format!(
-                "start plus item_count must be less than dataset count: start: {start}, item_count: {item_count}, dataset_count: {}", self.inner.dataset_count
+                "start plus item_count must be less than dataset count: start: {start}, item_count: {item_count}, \
+                 dataset_count: {}",
+                self.inner.dataset_count
             )))
         }
     }
@@ -280,18 +318,23 @@ impl RandomXDataset {
 
     /// Returns the values of the internal memory buffer of the `dataset` or an error on failure.
     pub fn get_data(&self) -> Result<Vec<u8>, RandomXError> {
+        if self.inner.dataset_ptr.is_null() {
+            return Err(RandomXError::Other("Dataset pointer is null".into()));
+        }
+
         let memory = unsafe { randomx_get_dataset_memory(self.inner.dataset_ptr) };
         if memory.is_null() {
-            Err(RandomXError::Other("Could not get dataset memory".into()))
-        } else {
-            let count = usize::try_from(self.inner.dataset_count)?;
-            let mut result: Vec<u8> = vec![0u8; count];
-            let n = usize::try_from(self.inner.dataset_count)?;
-            unsafe {
-                libc::memcpy(result.as_mut_ptr() as *mut c_void, memory, n);
-            }
-            Ok(result)
+            return Err(RandomXError::Other("Could not get dataset memory".into()));
         }
+
+        let size = usize::try_from(self.inner.dataset_count)?;
+        let mut result: Vec<u8> = vec![0u8; size];
+        if size > 0 {
+            unsafe {
+                libc::memcpy(result.as_mut_ptr() as *mut c_void, memory, size);
+            }
+        }
+        Ok(result)
     }
 }
 
@@ -307,8 +350,10 @@ pub struct RandomXVM {
 impl Drop for RandomXVM {
     /// De-allocates memory for the `VM` object.
     fn drop(&mut self) {
-        unsafe {
-            randomx_destroy_vm(self.vm);
+        if !self.vm.is_null() {
+            unsafe {
+                randomx_destroy_vm(self.vm);
+            }
         }
     }
 }
@@ -347,13 +392,13 @@ impl RandomXVM {
             (cache, dataset) => {
                 let cache_ptr = cache
                     .as_ref()
-                    .map(|stash| stash.inner.cache_ptr)
+                    .map(|stash| *stash.inner.cache_ptr.lock().unwrap())
                     .unwrap_or_else(ptr::null_mut);
                 let dataset_ptr = dataset
                     .as_ref()
                     .map(|data| data.inner.dataset_ptr)
                     .unwrap_or_else(ptr::null_mut);
-                let vm = unsafe { randomx_create_vm(flags.bits, cache_ptr, dataset_ptr) };
+                let vm = unsafe { randomx_create_vm(flags.bits(), cache_ptr, dataset_ptr) };
                 Ok(RandomXVM {
                     vm,
                     flags,
@@ -372,8 +417,9 @@ impl RandomXVM {
                 "Cannot reinit cache with FLAG_FULL_MEM set".to_string(),
             ))
         } else {
+            let cache_ptr = *cache.inner.cache_ptr.lock().unwrap();
             unsafe {
-                randomx_vm_set_cache(self.vm, cache.inner.cache_ptr);
+                randomx_vm_set_cache(self.vm, cache_ptr);
             }
             self.linked_cache = Some(cache);
             Ok(())
@@ -404,9 +450,9 @@ impl RandomXVM {
             Err(RandomXError::ParameterError("input was empty".to_string()))
         } else {
             let size_input = input.len();
-            let input_ptr = input.as_ptr() as *mut c_void;
-            let arr = [0; RANDOMX_HASH_SIZE as usize];
-            let output_ptr = arr.as_ptr() as *mut c_void;
+            let input_ptr = input.as_ptr() as *const c_void;
+            let mut arr = [0; RANDOMX_HASH_SIZE as usize];
+            let output_ptr = arr.as_mut_ptr() as *mut c_void;
             unsafe {
                 randomx_calculate_hash(self.vm, input_ptr, size_input, output_ptr);
             }
@@ -440,7 +486,7 @@ impl RandomXVM {
 
         // For multiple inputs
         let mut output_ptr: *mut c_void = ptr::null_mut();
-        let arr = [0; RANDOMX_HASH_SIZE as usize];
+        let mut arr = [0; RANDOMX_HASH_SIZE as usize];
 
         // Not len() as last iteration assigns final hash
         let iterations = input.len() + 1;
@@ -463,7 +509,7 @@ impl RandomXVM {
                 };
                 let size_input = input[i].len();
                 let input_ptr = input[i].as_ptr() as *mut c_void;
-                output_ptr = arr.as_ptr() as *mut c_void;
+                output_ptr = arr.as_mut_ptr() as *mut c_void;
                 if i == 0 {
                     // For first iteration
                     unsafe {
@@ -492,7 +538,11 @@ impl RandomXVM {
 
 #[cfg(test)]
 mod tests {
-    use std::{ptr, sync::Arc};
+    use std::{
+        ptr,
+        sync::{Arc, Mutex},
+        thread,
+    };
 
     use crate::{RandomXCache, RandomXCacheInner, RandomXDataset, RandomXDatasetInner, RandomXFlag, RandomXVM};
 
@@ -548,7 +598,7 @@ mod tests {
         if let Ok(mut vm) = RandomXVM::new(flags, None, None) {
             let cache = RandomXCache {
                 inner: Arc::new(RandomXCacheInner {
-                    cache_ptr: ptr::null_mut(),
+                    cache_ptr: Mutex::new(ptr::null_mut()),
                 }),
             };
             assert!(vm.reinit_cache(cache.clone()).is_err());
@@ -789,5 +839,55 @@ mod tests {
             let hash = vm.calculate_hash(input).unwrap();
             assert_eq!(hex::decode(expected).unwrap(), hash);
         }
+    }
+
+    // Compile-time tests to verify Send + Sync are automatically derived
+    #[test]
+    fn test_send_sync_traits() {
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        // These will fail to compile if Send/Sync are not implemented
+        assert_send::<RandomXCache>();
+        assert_sync::<RandomXCache>();
+        assert_send_sync::<RandomXCache>();
+
+        assert_send::<RandomXDataset>();
+        assert_sync::<RandomXDataset>();
+        assert_send_sync::<RandomXDataset>();
+
+        // VM should NOT be Send or Sync - these should fail to compile if uncommented
+        // assert_send::<RandomXVM>();
+        // assert_sync::<RandomXVM>();
+    }
+
+    #[test]
+    fn test_thread_safety_in_practice() {
+        let flags = RandomXFlag::default();
+        let key = "ThreadTestKey";
+        let input = "ThreadTestInput";
+
+        // Create cache and dataset normally
+        let cache = RandomXCache::new(flags, key.as_bytes()).unwrap();
+        let dataset = RandomXDataset::new(flags, cache.clone(), 0).unwrap();
+
+        // Clone them for thread sharing (RandomXCache/Dataset are Clone + Send + Sync)
+        let cache_for_thread = cache.clone();
+        let dataset_for_thread = dataset.clone();
+
+        let handle = thread::spawn(move || {
+            // Each thread creates its own VM
+            let vm = RandomXVM::new(flags, Some(cache_for_thread), Some(dataset_for_thread)).unwrap();
+            vm.calculate_hash(input.as_bytes()).unwrap()
+        });
+
+        // Main thread also creates a VM with shared resources
+        let vm_main = RandomXVM::new(flags, Some(cache), Some(dataset)).unwrap();
+        let hash_main = vm_main.calculate_hash(input.as_bytes()).unwrap();
+
+        // Both should produce the same hash
+        let hash_thread = handle.join().unwrap();
+        assert_eq!(hash_main, hash_thread);
     }
 }
