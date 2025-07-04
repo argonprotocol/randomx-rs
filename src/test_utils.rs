@@ -58,7 +58,6 @@ pub fn fuzz_randomx_alloc_cache(data: Vec<u8>) -> bool {
 /// - `pub fn randomx_init_cache`
 /// - `pub fn randomx_release_cache`
 #[allow(clippy::needless_pass_by_value)] // This is required by the `QuickCheck` fuzzing framework
-
 pub fn fuzz_randomx_create_vm_with_cache_only(data: Vec<u8>) -> bool {
     let flags = RandomXFlag::get_recommended_flags();
     if let Ok(cache) = RandomXCache::new(flags, &data) {
@@ -134,7 +133,7 @@ fn calculate_hashes(hash_data: &[u8], vm: &mut RandomXVM, iterations: u8) {
 /// - `pub fn randomx_calculate_hash_last`
 /// - `pub fn randomx_calculate_hash_first`
 /// - `pub fn randomx_calculate_hash_next`
-/// Secondary:
+///   Secondary:
 /// - `pub fn randomx_create_vm`
 /// - `pub fn randomx_destroy_vm`
 /// - `pub fn randomx_alloc_cache`
@@ -158,7 +157,7 @@ pub fn fuzz_randomx_vm_calculate_hash_with_cache_only(data: Vec<u8>) -> bool {
 /// - `pub fn randomx_calculate_hash_last`
 /// - `pub fn randomx_calculate_hash_first`
 /// - `pub fn randomx_calculate_hash_next`
-/// Secondary:
+///   Secondary:
 /// - `pub fn randomx_create_vm`
 /// - `pub fn randomx_destroy_vm`
 /// - `pub fn randomx_alloc_cache`
@@ -189,10 +188,8 @@ mod tests {
     use quickcheck::QuickCheck;
 
     use crate::test_utils::{
-        fuzz_randomx_alloc_cache,
-        fuzz_randomx_create_vm_with_cache_and_dataset,
-        fuzz_randomx_create_vm_with_cache_only,
-        fuzz_randomx_vm_calculate_hash_with_cache_and_dataset,
+        fuzz_randomx_alloc_cache, fuzz_randomx_create_vm_with_cache_and_dataset,
+        fuzz_randomx_create_vm_with_cache_only, fuzz_randomx_vm_calculate_hash_with_cache_and_dataset,
         fuzz_randomx_vm_calculate_hash_with_cache_only,
     };
 
