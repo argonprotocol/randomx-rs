@@ -399,6 +399,10 @@ impl RandomXVM {
                     .map(|data| data.inner.dataset_ptr)
                     .unwrap_or_else(ptr::null_mut);
                 let vm = unsafe { randomx_create_vm(flags.bits(), cache_ptr, dataset_ptr) };
+                if vm.is_null() {
+                    return Err(RandomXError::CreationError("Failed to allocate VM".to_string()));
+                }
+
                 Ok(RandomXVM {
                     vm,
                     flags,
